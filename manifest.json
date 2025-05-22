@@ -1,0 +1,51 @@
+{
+  "name": "Advault DNS Ext Ad Blocker",
+  "version": "7.5",
+  "manifest_version": 3,
+  "description": "Ad Blocker uses DNS Scripts to Block Ads. Utilizes a large, efficient static blocklist.",
+  "permissions": [
+    "declarativeNetRequest",
+    "alarms",
+    "contextMenus",
+    "privacy",
+    "storage",
+    "tabs",
+    "unlimitedStorage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*",
+    "http://185.107.97.246/*" 
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      { "id": "blocklist_part1", "enabled": true, "path": "rulesets/rules_part1.json" },
+      { "id": "blocklist_part2", "enabled": true, "path": "rulesets/rules_part2.json" },
+      { "id": "blocklist_part3", "enabled": true, "path": "rulesets/rules_part3.json" },
+      { "id": "blocklist_part4", "enabled": true, "path": "rulesets/rules_part4.json" },
+      { "id": "blocklist_part5", "enabled": true, "path": "rulesets/rules_part5.json" },
+      { "id": "blocklist_part6", "enabled": true, "path": "rulesets/rules_part6.json" },
+      { "id": "blocklist_part7", "enabled": true, "path": "rulesets/rules_part7.json" },
+      { "id": "blocklist_part8", "enabled": true, "path": "rulesets/rules_part8.json" },
+      { "id": "blocklist_part9", "enabled": true, "path": "rulesets/rules_part9.json" }
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.youtube.com/*"
+      ],
+      "js": [
+      "content.js",
+      "AdvaultDOM.js"
+      ],
+      "all_frames": true,
+      "sub_frame": true,
+      "run_at": "document_start"
+    }
+  ]
+}

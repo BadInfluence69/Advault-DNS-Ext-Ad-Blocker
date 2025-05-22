@@ -1,0 +1,273 @@
+import sys
+import os
+import time
+import socket
+import threading
+import re
+import requests
+from datetime import datetime
+from dnslib import DNSRecord, QTYPE, RR, A
+from colorama import Fore, Style, init
+
+# Initialize Colorama for color-coded terminal output
+init(autoreset=True)
+
+# ----------------------------
+# Configuration
+# ----------------------------
+# Your AdVault blocklist sources AND the carefully selected DNS-compatible lists
+blocklist_sources = [
+    # Your existing custom lists (assuming they are plain text domain lists)
+    "http://185.107.97.246/AdVault/dynamic_blocklist.txt",
+    "http://185.107.97.246/AdVault/list.txt",
+
+    # Core & Highly Recommended DNS-Compatible Blocklists
+    # StevenBlack's Unified Hosts File (Good general purpose, large list)
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+    # AdGuard DNS Filter (Specifically designed for DNS blocking)
+    "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
+    # OISD Big List (Highly curated, low false positives, DNS-friendly)
+    "https://abp.oisd.nl/",
+    # SomeoneWhoCares.org Hosts File (Classic, reliable hosts file)
+    "https://someonewhocares.org/hosts/hosts",
+    # Yoyo.org Ad Servers List (Another classic, pure hosts file format)
+    "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=1&mimetype=plaintext",
+
+    # Selected EasyList/Fanboy Lists (These are primarily for browsers,
+    # but the plain text versions often contain many useful domains.
+    # The cleanup_domain function will extract relevant domains.)
+    "https://easylist-downloads.adblockplus.org/fanboy-annoyance.txt",
+    "https://easylist.to/easylistgermany/easylistgermany.txt",
+    "https://easylist-downloads.adblockplus.org/easylistgermany.txt",
+    "https://secure.fanboy.co.nz/fanboy-cookiemonster_ubo.txt",
+    "https://secure.fanboy.co.nz/fanboy-social_ubo.txt",
+    "https://secure.fanboy.co.nz/fanboy-antifacebook.txt",
+    
+    # Malware & Phishing Specific Lists (Focus on domain-based lists)
+    "https://malware-filter.gitlab.io/urlhaus-filter/urlhaus-filter-ag-online.txt", # URLhaus filter
+    "https://malware-filter.gitlab.io/phishing-filter/phishing-filter.txt", # Phishing filter
+
+    # Regional/Language-Specific Lists (These tend to be simpler domain lists)
+    "https://raw.githubusercontent.com/AnXh3L0/blocklist/master/albanian-easylist-addition/Albania.txt",
+    "https://easylist-downloads.adblockplus.org/Liste_AR.txt", # EasyList Arabic
+    "https://stanev.org/abp/adblock_bg.txt", # Bulgarian Adblock List
+    "https://raw.githubusercontent.com/tomasko126/easylistczechandslovak/master/filters.txt", # EasyList Czech/Slovak
+    "https://adblock.ee/list.txt", # Estonian Adblock List
+    "https://raw.githubusercontent.com/finnish-easylist-addition/finnish-easylist-addition/gh-pages/Finland_adb.txt", # Finnish Adblock List
+    "https://www.void.gr/kargig/void-gr-filters.txt", # Greek Adblock List
+    "https://raw.githubusercontent.com/DandelionSprout/adfilt/master/SerboCroatianList.txt",
+    "https://raw.githubusercontent.com/ABPindo/indonesianadblockrules/master/subscriptions/abpindo.txt", # Indonesian Adblock Rules
+    "https://easylist-downloads.adblockplus.org/indianlist.txt", # Indian List
+    "https://raw.githubusercontent.com/MasterKia/PersianBlocker/main/PersianBlocker.txt", # Persian Blocker
+    "https://raw.githubusercontent.com/brave/adblock-lists/master/custom/is.txt", # Icelandic List (from Brave)
+    "https://raw.githubusercontent.com/easylist/EasyListHebrew/master/EasyListHebrew.txt", # EasyList Hebrew
+    "https://easylist-downloads.adblockplus.org/easylistitaly.txt", # EasyList Italy
+    "https://cdn.jsdelivr.net/gh/List-KR/List-KR@latest/filter-uBlockOrigin.txt", # List-KR
+] 
+
+allowlist_file = "allowlist.txt" # You can maintain this file for domains you never want to block
+blocked_domains_log_file = "blocked_domains.log" # Log of domains that were blocked
+dns_host = "0.0.0.0"
+dns_port = 53
+google_dns = ("1.1.1.1", 53) # Your upstream DNS server (Cloudflare DNS)
+
+# Global sets for efficient lookups
+blocked_domains = set()
+allowed_domains = set()
+
+# Lock for updating domain sets to prevent race conditions
+domain_set_lock = threading.Lock()
+
+# ----------------------------
+# Domain Management Functions
+# ----------------------------
+def cleanup_domain(domain):
+    """
+    Cleans up a domain name by removing common invalid characters
+    and ensuring it's in a consistent format for matching.
+    Handles 'hosts' file format (IP_ADDRESS DOMAIN_NAME) and simple domain lists.
+    """
+    domain = domain.strip().lower()
+
+    # Skip comments and empty lines
+    if not domain or domain.startswith('#'):
+        return ""
+
+    # Handle hosts file format (e.g., "0.0.0.0 example.com")
+    parts = domain.split()
+    if len(parts) > 1 and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", parts[0]):
+        domain = parts[1] # Take the domain part
+
+    # Remove scheme (http/https), www., and anything after first slash
+    domain = re.sub(r"^(https?://)?(www\.)?", "", domain)
+    if '/' in domain:
+        domain = domain.split('/')[0]
+    
+    # Remove any characters that are not alphanumeric, periods, or hyphens
+    # This also helps filter out complex adblock rules (e.g., ##div, $script, etc.)
+    domain = re.sub(r"[^a-z0-9\.-]", "", domain)
+
+    # Remove any leading/trailing hyphens or periods that might result from cleanup
+    domain = domain.strip("-.")
+    
+    return domain
+
+def load_domains_from_file(filepath):
+    """Loads domains from a local file into a set."""
+    domains = set()
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            for line in f:
+                domain = cleanup_domain(line)
+                if domain: # Only add if cleanup resulted in a valid domain
+                    domains.add(domain)
+    return domains
+
+def fetch_and_load_remote_blocklists():
+    """Fetches domains from remote URLs and adds them to the blocklist."""
+    global blocked_domains
+    temp_blocklist = set()
+    print(Fore.BLUE + "[INFO] Fetching remote blocklists...")
+    for url in blocklist_sources:
+        try:
+            response = requests.get(url, timeout=15) # Increased timeout
+            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+            
+            lines_fetched = 0
+            for line in response.text.splitlines():
+                domain = cleanup_domain(line)
+                if domain: # Only add if cleanup resulted in a valid domain
+                    temp_blocklist.add(domain)
+                    lines_fetched += 1
+            print(Fore.GREEN + f"[INFO] Fetched {lines_fetched} entries from {url}.")
+        except requests.exceptions.Timeout:
+            print(Fore.RED + f"[ERROR] Request to {url} timed out after 15 seconds.")
+        except requests.exceptions.RequestException as e:
+            print(Fore.RED + f"[ERROR] Failed to fetch {url}: {e}")
+        except Exception as e:
+            print(Fore.RED + f"[ERROR] An unexpected error occurred while fetching {url}: {e}")
+
+    with domain_set_lock:
+        # Clear existing blocked_domains and add all fresh ones to handle list updates
+        blocked_domains.clear() 
+        blocked_domains.update(temp_blocklist)
+    print(Fore.GREEN + f"[INFO] Total blocked domains updated to: {len(blocked_domains)}")
+
+def is_domain_blocked(qname):
+    """Checks if a domain should be blocked, considering allowlist and blocklist."""
+    qname_cleaned = cleanup_domain(qname)
+
+    with domain_set_lock:
+        # Check allowlist first (highest priority)
+        if qname_cleaned in allowed_domains:
+            return False
+
+        # Check if the exact domain is blocked
+        if qname_cleaned in blocked_domains:
+            return True
+
+        # Check for subdomains (e.g., if 'example.com' is blocked, 'sub.example.com' is blocked)
+        # Iterate over parts of the domain (e.g., for 'a.b.c.d', check 'c.d', then 'b.c.d', then 'a.b.c.d')
+        parts = qname_cleaned.split('.')
+        for i in range(len(parts)):
+            sub_domain_candidate = ".".join(parts[i:])
+            if sub_domain_candidate in blocked_domains:
+                return True
+                
+    return False
+
+def log_blocked_domain(domain):
+    """Logs blocked domains to a file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(blocked_domains_log_file, "a") as f:
+            f.write(f"{timestamp} - {domain}\n")
+    except Exception as e:
+        print(Fore.RED + f"[ERROR] Failed to log blocked domain '{domain}': {e}")
+
+# ----------------------------
+# DNS Server Logic
+# ----------------------------
+def dns_server():
+    """Starts the DNS server to listen for and respond to DNS queries."""
+    print(Fore.GREEN + f"[DNS] 🚀 Starting DNS server on {dns_host}:{dns_port}")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind((dns_host, dns_port))
+
+        while True:
+            try:
+                data, addr = sock.recvfrom(512)
+                request = DNSRecord.parse(data)
+                qname = str(request.q.qname).strip('.')
+
+                if is_domain_blocked(qname):
+                    print(Fore.RED + f"[DNS] 🚫 BLOCKED: {qname} (from {addr[0]})")
+                    log_blocked_domain(qname) # Log the blocked domain
+                    reply = request.reply()
+                    reply.add_answer(RR(qname, QTYPE.A, rdata=A("0.0.0.0"))) # Sinkhole to 0.0.0.0
+                    sock.sendto(reply.pack(), addr)
+                else:
+                    # Forward to upstream DNS server
+                    upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    upstream_sock.settimeout(10) # Set a generous timeout for upstream query
+                    try:
+                        upstream_sock.sendto(data, google_dns)
+                        response_data, _ = upstream_sock.recvfrom(512)
+                        sock.sendto(response_data, addr)
+                    except socket.timeout:
+                        print(Fore.YELLOW + f"[DNS] ⚠️ Upstream DNS timeout for {qname}. Sending SERVFAIL.")
+                        reply = request.reply()
+                        reply.header.rcode = 2 # SERVFAIL
+                        sock.sendto(reply.pack(), addr)
+                    except Exception as e:
+                        print(Fore.RED + f"[DNS ERROR] Upstream query failed for {qname}: {e}. Sending SERVFAIL.")
+                        reply = request.reply()
+                        reply.header.rcode = 2 # SERVFAIL
+                        sock.sendto(reply.pack(), addr)
+                    finally:
+                        upstream_sock.close()
+
+            except Exception as e:
+                print(Fore.RED + f"[DNS ERROR] Error processing DNS request: {e}")
+
+# ----------------------------
+# Main Execution
+# ----------------------------
+if __name__ == "__main__":
+    # Load initial allowlist
+    print(Fore.BLUE + "[INFO] Loading initial allowlist and blocklist...")
+    allowed_domains = load_domains_from_file(allowlist_file)
+    print(Fore.BLUE + f"[INFO] Loaded {len(allowed_domains)} domains into allowlist.")
+
+    # Start a thread to fetch remote blocklists initially and then periodically
+    def blocklist_updater():
+        while True:
+            fetch_and_load_remote_blocklists()
+            time.sleep(60 * 60 * 6) # Update every 6 hours
+
+    threading.Thread(target=blocklist_updater, daemon=True).start()
+
+    # Give a moment for initial blocklist fetch to complete before starting DNS server
+    print(Fore.BLUE + "[INFO] Waiting for initial blocklist fetch to complete...")
+    # A short sleep to ensure the updater thread starts fetching before DNS server is fully ready
+    time.sleep(2) 
+    
+    # You might want a more robust way to wait for the initial fetch,
+    # e.g., a simple flag set by fetch_and_load_remote_blocklists.
+    # For now, a slightly longer sleep or a loop checking len(blocked_domains) > 0
+    # after the thread starts could be considered.
+    # For a production system, use a threading.Event or similar.
+    # For this example, let's just make sure the initial fetch has a chance to happen.
+    initial_fetch_timeout = 60 # Wait up to 60 seconds for initial fetch
+    start_time = time.time()
+    while not blocked_domains and (time.time() - start_time) < initial_fetch_timeout:
+        time.sleep(1)
+    
+    if not blocked_domains:
+        print(Fore.YELLOW + "[WARNING] Initial blocklist fetch might not have completed or failed. Starting DNS server with empty blocklist.")
+    else:
+        print(Fore.BLUE + f"[INFO] Initial blocklist fetch likely complete with {len(blocked_domains)} domains.")
+
+
+    # Start the DNS server
+    dns_server()

@@ -1,0 +1,9 @@
+{
+"enabled": true,
+"PremiumClientSharedConfig__enable_att_context_processor":true,
+"PremiumClientSharedConfig__enable_att_for_get_download_action_on_web_client":true,
+"PremiumClientSharedConfig__enable_att_for_get_premium_on_web_client":true,
+"ab_det_apb_b":true,
+"ab_det_el_h":true,
+"ab_det_pp_ov":true
+}
